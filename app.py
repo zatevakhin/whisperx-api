@@ -9,6 +9,7 @@ from functools import lru_cache
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 
+# NOTE: https://github.com/pyannote/pyannote-audio/issues/1370
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
