@@ -4,10 +4,9 @@ import gc
 import torch
 import whisperx
 import soundfile as sf
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 from functools import lru_cache
-from pydantic import BaseModel, Field
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -16,30 +15,22 @@ torch.backends.cudnn.allow_tf32 = False
 app = FastAPI(title="WhisperX API", description="API for audio transcription using WhisperX")
 
 # Environment variables
-HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN")
+HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", None)
 DEVICE = os.environ.get("DEVICE", "cpu")
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8")
 MODEL_DIR = os.environ.get("MODEL_DIR", None)
-MODEL_SIZE = os.environ.get("MODEL_SIZE", "small")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 MODEL_CACHE_SIZE = int(os.environ.get("MODEL_CACHE_SIZE", "3"))
-
-# Pydantic models for request validation
-class TranscriptionRequest(BaseModel):
-    batch_size: int = Field(default=16, description="Batch size for transcription. Reduce if low on GPU memory")
-    diarize: bool = Field(default=False, description="Whether to perform speaker diarization")
-    align_words: bool = Field(default=False, description="Whether to align words")
-    min_speakers: Optional[int] = Field(default=None, description="Minimum number of speakers for diarization")
-    max_speakers: Optional[int] = Field(default=None, description="Maximum number of speakers for diarization")
-    allowed_languages: Optional[List[str]] = Field(default=None, description="List of allowed languages for transcription")
 
 # Model caches
 @lru_cache(maxsize=MODEL_CACHE_SIZE)
-def get_transcription_model():
+def get_transcription_model(model: Optional[str] = None):
+    print(f"Loading model =: {model}, {WHISPER_MODEL}")
+    model = model if model is not None else WHISPER_MODEL
+
+    print(f"Loading model: {model}")
     return whisperx.load_model(
-        MODEL_SIZE,
-        DEVICE,
-        compute_type=COMPUTE_TYPE,
-        download_root=MODEL_DIR
+        model, DEVICE, compute_type=COMPUTE_TYPE, download_root=MODEL_DIR
     )
 
 @lru_cache(maxsize=MODEL_CACHE_SIZE)
@@ -49,7 +40,7 @@ def get_alignment_model(language_code):
 @lru_cache(maxsize=1)
 def get_diarization_model():
     if not HF_AUTH_TOKEN:
-        raise ValueError("HF_TOKEN environment variable is required for diarization")
+        raise ValueError("HF_AUTH_TOKEN environment variable is required for diarization")
     return whisperx.DiarizationPipeline(use_auth_token=HF_AUTH_TOKEN, device=DEVICE)
 
 def load_audio_from_bytes(audio_bytes):
@@ -64,7 +55,13 @@ def load_audio_from_bytes(audio_bytes):
 @app.post("/transcribe", response_model=Dict[str, Any])
 async def transcribe(
     file: UploadFile = File(...),
-    request: TranscriptionRequest = Depends()
+    batch_size: int = Form(16, description="Batch size for transcription. Reduce if low on GPU memory"),
+    diarize: bool = Form(False, description="Whether to perform speaker diarization"),
+    align_words: bool = Form(False, description="Whether to align words"),
+    whisper_model: Optional[str] = Form(default=None, description=f"Model used for transcription instead of (default: ${WHISPER_MODEL})"),
+    min_speakers: Optional[int] = Form(None, description="Minimum number of speakers for diarization"),
+    max_speakers: Optional[int] = Form(None, description="Maximum number of speakers for diarization"),
+    allowed_languages: Optional[str] = Form(None, description="Comma-separated list of allowed languages for transcription")
 ):
     """
     Transcribe audio file using WhisperX
@@ -76,24 +73,20 @@ async def transcribe(
         audio_bytes = await file.read()
         audio_data, _ = load_audio_from_bytes(audio_bytes)
 
-        # Get transcription model
-        model = get_transcription_model()
+        model = get_transcription_model(whisper_model)
 
-        # Transcribe audio
         result = model.transcribe(
             audio_data,
-            batch_size=request.batch_size
+            batch_size=batch_size
         )
 
-        # Filter language if allowed languages are specified
-        if request.allowed_languages and result["language"] not in request.allowed_languages:
+        if allowed_languages and result["language"] not in allowed_languages:
             raise HTTPException(
                 status_code=400,
-                detail=f"Detected language {result['language']} is not in allowed languages: {request.allowed_languages}"
+                detail=f"Detected language {result['language']} is not in allowed languages: {allowed_languages}"
             )
 
-        # Align words if requested
-        if request.align_words:
+        if align_words:
             try:
                 model_a, metadata = get_alignment_model(result["language"])
                 result = whisperx.align(
@@ -108,8 +101,7 @@ async def transcribe(
                 print(f"Warning: Word alignment failed: {str(e)}")
                 # Continue with unaligned result
 
-        # Perform diarization if requested
-        if request.diarize:
+        if diarize:
             try:
                 if not HF_AUTH_TOKEN:
                     raise HTTPException(
@@ -119,16 +111,14 @@ async def transcribe(
 
                 diarize_model = get_diarization_model()
 
-                # Add min/max number of speakers if specified
                 diarize_kwargs = {}
-                if request.min_speakers is not None:
-                    diarize_kwargs["min_speakers"] = request.min_speakers
-                if request.max_speakers is not None:
-                    diarize_kwargs["max_speakers"] = request.max_speakers
+                if min_speakers is not None:
+                    diarize_kwargs["min_speakers"] = min_speakers
+                if max_speakers is not None:
+                    diarize_kwargs["max_speakers"] = max_speakers
 
                 diarize_segments = diarize_model(audio_data, **diarize_kwargs)
 
-                # Assign speaker labels to words
                 result = whisperx.assign_word_speakers(diarize_segments, result)
             except Exception as e:
                 print(f"Warning: Diarization failed: {str(e)}")
