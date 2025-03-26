@@ -24,11 +24,159 @@ MODEL_DIR = os.environ.get("MODEL_DIR", None)
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 MODEL_CACHE_SIZE = int(os.environ.get("MODEL_CACHE_SIZE", "3"))
 
-class ResponseData(TypedDict):
-    transcription: Optional[TypedDict] = None
-    align: Optional[TypedDict] = None
-    diarized: dict = None
-    words: dict = None
+from typing import Dict, List, Optional, Any
+from typing_extensions import TypedDict
+from collections import defaultdict
+
+from typing import Dict, List, Optional, Any
+from typing_extensions import TypedDict
+from collections import defaultdict
+
+class Word(TypedDict):
+    word: str
+    start: float
+    end: float
+
+class Speaker(TypedDict):
+    id: str
+    label: str
+    total_time: float
+
+class Segment(TypedDict):
+    text: str
+    start: float
+    end: float
+    speaker: Optional[str]
+    words: List[Word]
+
+class FormattedTranscript(TypedDict):
+    transcript: str
+    language: str
+    duration: float
+    speakers: List[Speaker]
+    segments: List[Segment]
+
+class TranscriptFormatter:
+    @staticmethod
+    def format(
+        transcription: Dict[str, Any],
+        aligned_segments: Optional[Dict[str, Any]] = None,
+        diarized_segments: Optional[List[Dict[str, Any]]] = None,
+        word_speakers: Optional[Dict[str, Any]] = None
+    ) -> FormattedTranscript:
+        """
+        Format the WhisperX output into a cleaner structure
+
+        Args:
+            transcription: The raw transcription output
+            aligned_segments: Word-aligned segments if available
+            diarized_segments: Speaker diarization information if available
+            word_speakers: Word-level speaker assignments if available
+
+        Returns:
+            A formatted transcript in a cleaner structure
+        """
+        # Initialize result
+        result: FormattedTranscript = {
+            "transcript": "",
+            "language": transcription.get("language", ""),
+            "duration": 0.0,
+            "speakers": [],
+            "segments": []
+        }
+
+        # Get full transcript text
+        if "segments" in transcription:
+            full_text = " ".join([segment.get("text", "").strip() for segment in transcription["segments"]])
+            result["transcript"] = full_text
+
+            # Set duration to the end time of the last segment
+            if transcription["segments"]:
+                result["duration"] = transcription["segments"][-1].get("end", 0.0)
+
+        # Process speakers if diarization is available
+        speakers_dict = {}
+        if diarized_segments:
+            speaker_times = defaultdict(float)
+            speaker_labels = {}
+
+            for segment in diarized_segments:
+                speaker_id = segment.get("speaker", "")
+                label = segment.get("label", "")
+                start_time = segment.get("start", 0.0)
+                end_time = segment.get("end", 0.0)
+
+                if speaker_id:
+                    duration = end_time - start_time
+                    speaker_times[speaker_id] += duration
+                    speaker_labels[speaker_id] = label
+
+            for speaker_id, total_time in speaker_times.items():
+                speakers_dict[speaker_id] = {
+                    "id": speaker_id,
+                    "label": speaker_labels.get(speaker_id, ""),
+                    "total_time": round(total_time, 3)
+                }
+
+            result["speakers"] = list(speakers_dict.values())
+
+        # Use aligned_segments if available, otherwise use transcription segments
+        source_segments = aligned_segments if aligned_segments and "segments" in aligned_segments else transcription
+
+        if "segments" in source_segments:
+            for segment in source_segments["segments"]:
+                formatted_segment: Segment = {
+                    "text": segment.get("text", "").strip(),
+                    "start": segment.get("start", 0.0),
+                    "end": segment.get("end", 0.0),
+                    "speaker": None,
+                    "words": []
+                }
+
+                # Add words if available
+                if "words" in segment:
+                    for word in segment["words"]:
+                        formatted_segment["words"].append({
+                            "word": word.get("word", ""),
+                            "start": word.get("start", 0.0),
+                            "end": word.get("end", 0.0)
+                        })
+
+                # Add speaker information if word_speakers is available
+                if word_speakers and "segments" in word_speakers:
+                    for ws_segment in word_speakers["segments"]:
+                        if (ws_segment.get("start") == segment.get("start") and
+                            ws_segment.get("end") == segment.get("end")):
+                            formatted_segment["speaker"] = ws_segment.get("speaker", None)
+                            break
+                # If no speaker was assigned and diarized segments are available, try to assign a speaker
+                if formatted_segment["speaker"] is None and diarized_segments:
+                    segment_start = formatted_segment["start"]
+                    segment_end = formatted_segment["end"]
+
+                    # Find the diarized segment with the most overlap
+                    best_overlap = 0
+                    best_speaker = None
+
+                    for d_segment in diarized_segments:
+                        d_start = d_segment.get("start", 0.0)
+                        d_end = d_segment.get("end", 0.0)
+
+                        # Calculate overlap
+                        overlap_start = max(segment_start, d_start)
+                        overlap_end = min(segment_end, d_end)
+                        overlap = max(0, overlap_end - overlap_start)
+
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_speaker = d_segment.get("speaker", None)
+
+                    if best_speaker:
+                        formatted_segment["speaker"] = best_speaker
+
+                result["segments"].append(formatted_segment)
+
+        return result
 
 # Model caches
 @lru_cache(maxsize=MODEL_CACHE_SIZE)
@@ -83,24 +231,25 @@ async def transcribe(
 
         model = get_transcription_model(whisper_model)
 
-        result = ResponseData()
-
-        result["transcription"] = model.transcribe(
+        aligned_segments = None
+        diarized = None
+        word_speakers = None
+        transcription = model.transcribe(
             audio_data,
             batch_size=batch_size
         )
 
-        if allowed_languages and result["transcription"]["language"] not in allowed_languages:
+        if allowed_languages and transcription["language"] not in allowed_languages:
             raise HTTPException(
                 status_code=400,
-                detail=f"Detected language {result['transcription']['language']} is not in allowed languages: {allowed_languages}"
+                detail=f"Detected language {transcription['language']} is not in allowed languages: {allowed_languages}"
             )
 
         if align_words:
             try:
-                model_a, metadata = get_alignment_model(result["transcription"]["language"])
-                result["align"] = whisperx.align(
-                    result["transcription"]["segments"],
+                model_a, metadata = get_alignment_model(transcription["language"])
+                aligned_segments = whisperx.align(
+                    transcription["segments"],
                     model_a,
                     metadata,
                     audio_data,
@@ -128,16 +277,25 @@ async def transcribe(
                 if max_speakers is not None:
                     diarize_kwargs["max_speakers"] = max_speakers
 
-                diarized = diarize_model(audio_data, **diarize_kwargs)
-                result["diarized"] = diarized.to_dict(orient='records')
+                diarized_segments = diarize_model(audio_data, **diarize_kwargs)
+                diarized = diarized_segments.to_dict(orient='records')
+
                 if align_words:
-                    result["words"] = whisperx.assign_word_speakers(diarized, result["align"])
+                    word_speakers = whisperx.assign_word_speakers(diarized_segments, aligned_segments)
 
             except Exception as e:
                 print(f"Warning: Diarization failed: {str(e)}")
                 # Continue with non-diarized result
 
-        return result
+        # Format the output using TranscriptFormatter
+        formatted_transcript = TranscriptFormatter.format(
+            transcription=transcription,
+            aligned_segments=aligned_segments,
+            diarized_segments=diarized,
+            word_speakers=word_speakers
+        )
+
+        return formatted_transcript
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
