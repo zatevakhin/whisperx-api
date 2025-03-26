@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 from functools import lru_cache
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
+from typing_extensions import TypedDict
 
 # NOTE: https://github.com/pyannote/pyannote-audio/issues/1370
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -22,6 +23,12 @@ COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "int8")
 MODEL_DIR = os.environ.get("MODEL_DIR", None)
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 MODEL_CACHE_SIZE = int(os.environ.get("MODEL_CACHE_SIZE", "3"))
+
+class ResponseData(TypedDict):
+    transcription: Optional[TypedDict] = None
+    align: Optional[TypedDict] = None
+    diarized: dict = None
+    words: dict = None
 
 # Model caches
 @lru_cache(maxsize=MODEL_CACHE_SIZE)
@@ -76,28 +83,31 @@ async def transcribe(
 
         model = get_transcription_model(whisper_model)
 
-        result = model.transcribe(
+        result = ResponseData()
+
+        result["transcription"] = model.transcribe(
             audio_data,
             batch_size=batch_size
         )
 
-        if allowed_languages and result["language"] not in allowed_languages:
+        if allowed_languages and result["transcription"]["language"] not in allowed_languages:
             raise HTTPException(
                 status_code=400,
-                detail=f"Detected language {result['language']} is not in allowed languages: {allowed_languages}"
+                detail=f"Detected language {result['transcription']['language']} is not in allowed languages: {allowed_languages}"
             )
 
         if align_words:
             try:
-                model_a, metadata = get_alignment_model(result["language"])
-                result = whisperx.align(
-                    result["segments"],
+                model_a, metadata = get_alignment_model(result["transcription"]["language"])
+                result["align"] = whisperx.align(
+                    result["transcription"]["segments"],
                     model_a,
                     metadata,
                     audio_data,
                     DEVICE,
                     return_char_alignments=False
                 )
+
             except Exception as e:
                 print(f"Warning: Word alignment failed: {str(e)}")
                 # Continue with unaligned result
@@ -118,9 +128,11 @@ async def transcribe(
                 if max_speakers is not None:
                     diarize_kwargs["max_speakers"] = max_speakers
 
-                diarize_segments = diarize_model(audio_data, **diarize_kwargs)
+                diarized = diarize_model(audio_data, **diarize_kwargs)
+                result["diarized"] = diarized.to_dict(orient='records')
+                if align_words:
+                    result["words"] = whisperx.assign_word_speakers(diarized, result["align"])
 
-                result = whisperx.assign_word_speakers(diarize_segments, result)
             except Exception as e:
                 print(f"Warning: Diarization failed: {str(e)}")
                 # Continue with non-diarized result
