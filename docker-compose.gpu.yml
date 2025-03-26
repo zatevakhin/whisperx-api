@@ -16,6 +16,17 @@ services:
     volumes:
       - data:/models
     restart: unless-stopped
+    healthcheck:
+      test: curl http://localhost:8000 || exit 1
+      interval: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: cdi
+            capabilities: [gpu]
+            device_ids:
+            - nvidia.com/gpu=all
 
 volumes:
   data:
