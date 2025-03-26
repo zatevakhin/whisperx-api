@@ -1,0 +1,21 @@
+---
+services:
+  whisperx-api:
+    build:
+      context: .
+      dockerfile: gpu.Dockerfile
+    image: whisperx-api:latest
+    environment:
+     - HF_AUTH_TOKEN=""
+     - DEVICE=cuda
+     - COMPUTE_TYPE=float16
+     - MODEL_DIR=/models
+     - WHISPER_MODEL=large-v3-turbo
+    ports:
+      - "8000:8000"
+    volumes:
+      - data:/models
+    restart: unless-stopped
+
+volumes:
+  data:

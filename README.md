@@ -165,5 +165,7 @@ print(result)
   - `small`: Good balance for most use cases
   - `medium`: Better accuracy, moderate resource usage
   - `large-v2`: Highest accuracy, highest resource usage
+  - `large-v3`: Highest accuracy and newest highest resource usage
+  - `large-v3-turbo`: Literally the best one as for now. Best accuracy per resources cost
 
 

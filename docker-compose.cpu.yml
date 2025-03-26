@@ -1,0 +1,20 @@
+---
+services:
+  whisperx-api:
+    build:
+      context: .
+      dockerfile: cpu.Dockerfile
+    image: whisperx-api:latest
+    environment:
+     - DEVICE=cpu
+     - COMPUTE_TYPE=int8
+     - MODEL_DIR=/models
+     - WHISPER_MODEL=base
+    ports:
+      - "8000:8000"
+    volumes:
+      - data:/models
+    restart: unless-stopped
+
+volumes:
+  data:
